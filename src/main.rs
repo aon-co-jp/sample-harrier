@@ -41,6 +41,7 @@
 //! 実行方法: `cargo run --release`
 
 mod audio;
+mod font;
 
 use std::ffi::CString;
 
@@ -51,9 +52,6 @@ use raw_window_handle::{HasRawDisplayHandle, HasRawWindowHandle};
 use winit::event::{ElementState, Event, VirtualKeyCode, WindowEvent};
 use winit::event_loop::{ControlFlow, EventLoop};
 use winit::window::WindowBuilder;
-
-const WIDTH: u32 = 640;
-const HEIGHT: u32 = 480;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -337,10 +335,17 @@ impl GameState {
 }
 
 fn main() {
+    // 日本語の操作説明はコンソールへ出力する(ユーザー指示、2026-08-10
+    // 「操作説明は下側に付けて英語と日本語で」——英文は画面下のHUDバナー
+    // (`font.rs`の自作5x7ビットマップフォント)で常時表示し、日本語グリフ
+    // は用意していないためコンソール/この起動メッセージ側で対応する)。
+    println!("=== sample-harrier 操作方法 ===");
+    println!("矢印キー/WASD: 照準移動   Space: 発射   Esc または ウィンドウのXボタン: 終了");
+
     let event_loop = EventLoop::new();
     let window = WindowBuilder::new()
         .with_title("sample-harrier: pseudo-3D scaling sprite prototype (Phase 0)")
-        .with_inner_size(winit::dpi::LogicalSize::new(WIDTH, HEIGHT))
+        .with_fullscreen(Some(winit::window::Fullscreen::Borderless(None)))
         .build(&event_loop)
         .expect("create window");
 
@@ -407,6 +412,7 @@ struct Renderer {
     floor_b_descriptor_set: vk::DescriptorSet,
     bullet_descriptor_set: vk::DescriptorSet,
     explosion_descriptor_set: vk::DescriptorSet,
+    hud_descriptor_set: vk::DescriptorSet,
     vertex_buffer: vk::Buffer,
     vertex_buffer_memory: vk::DeviceMemory,
     command_pool: vk::CommandPool,
@@ -421,19 +427,24 @@ struct Renderer {
     _floor_b_texture_image: vk::Image,
     _bullet_texture_image: vk::Image,
     _explosion_texture_image: vk::Image,
+    _hud_texture_image: vk::Image,
     sampler: vk::Sampler,
 }
 
 /// 固定スプライト(敵・照準・自機)+床`FLOOR_STRIPES`本+弾
-/// `MAX_BULLETS`発+爆発`MAX_EXPLOSIONS`個を毎フレーム描画する。
+/// `MAX_BULLETS`発+爆発`MAX_EXPLOSIONS`個+HUDバナー1枚を毎フレーム描画する。
 const FIXED_SPRITE_COUNT: usize = 3;
 const FLOOR_SPRITE_OFFSET: usize = FIXED_SPRITE_COUNT;
 const BULLET_SPRITE_OFFSET: usize = FLOOR_SPRITE_OFFSET + FLOOR_STRIPES;
 const EXPLOSION_SPRITE_OFFSET: usize = BULLET_SPRITE_OFFSET + MAX_BULLETS;
-const DRAWN_SPRITE_COUNT: usize = EXPLOSION_SPRITE_OFFSET + MAX_EXPLOSIONS;
-/// 一意のテクスチャ数(敵・照準・自機・床2色・弾・爆発)。
-const TEXTURE_COUNT: usize = FIXED_SPRITE_COUNT + 4;
+const HUD_SPRITE_INDEX: usize = EXPLOSION_SPRITE_OFFSET + MAX_EXPLOSIONS;
+const DRAWN_SPRITE_COUNT: usize = HUD_SPRITE_INDEX + 1;
+/// 一意のテクスチャ数(敵・照準・自機・床2色・弾・爆発・HUDバナー)。
+const TEXTURE_COUNT: usize = FIXED_SPRITE_COUNT + 5;
 const VERTS_PER_SPRITE: usize = 6;
+const HUD_TEXT: &str = "ARROWS/WASD MOVE  SPACE FIRE  ESC/X CLOSE";
+/// HUDバナーの画面下からの高さ(NDC単位)。
+const HUD_HEIGHT_NDC: f32 = 0.08;
 
 impl Renderer {
     unsafe fn new(window: &winit::window::Window) -> Result<Self, String> {
@@ -485,7 +496,8 @@ impl Renderer {
             .copied()
             .unwrap_or(surface_formats[0]);
         let present_mode = vk::PresentModeKHR::FIFO;
-        let extent = vk::Extent2D { width: WIDTH, height: HEIGHT };
+        let window_size = window.inner_size();
+        let extent = vk::Extent2D { width: window_size.width.max(1), height: window_size.height.max(1) };
         let image_count = (surface_caps.min_image_count + 1).min(if surface_caps.max_image_count > 0 { surface_caps.max_image_count } else { u32::MAX });
 
         let swapchain_info = vk::SwapchainCreateInfoKHR::builder()
@@ -569,6 +581,8 @@ impl Renderer {
         let (floor_b_image, floor_b_view) = create_solid_texture(&device, &memory_properties, queue, queue_family_index, Rgba8 { r: 15, g: 100, b: 25, a: 255 })?;
         let (bullet_image, bullet_view) = create_solid_texture(&device, &memory_properties, queue, queue_family_index, Rgba8 { r: 255, g: 255, b: 255, a: 255 })?;
         let (explosion_image, explosion_view) = create_solid_texture(&device, &memory_properties, queue, queue_family_index, Rgba8 { r: 250, g: 140, b: 20, a: 255 })?;
+        let hud_texture = font::render_text_banner(HUD_TEXT, 3, Rgba8 { r: 255, g: 255, b: 255, a: 255 }, Rgba8 { r: 10, g: 10, b: 15, a: 255 });
+        let (hud_image, hud_view) = create_texture_from_rgba(&device, &memory_properties, queue, queue_family_index, &hud_texture)?;
 
         let sampler_info = vk::SamplerCreateInfo::builder().mag_filter(vk::Filter::NEAREST).min_filter(vk::Filter::NEAREST);
         let sampler = device.create_sampler(&sampler_info, None).map_err(|e| e.to_string())?;
@@ -599,7 +613,8 @@ impl Renderer {
             floor_b_descriptor_set,
             bullet_descriptor_set,
             explosion_descriptor_set,
-        ) = (sets[0], sets[1], sets[2], sets[3], sets[4], sets[5], sets[6]);
+            hud_descriptor_set,
+        ) = (sets[0], sets[1], sets[2], sets[3], sets[4], sets[5], sets[6], sets[7]);
 
         for (set, view) in [
             (enemy_descriptor_set, enemy_view),
@@ -609,6 +624,7 @@ impl Renderer {
             (floor_b_descriptor_set, floor_b_view),
             (bullet_descriptor_set, bullet_view),
             (explosion_descriptor_set, explosion_view),
+            (hud_descriptor_set, hud_view),
         ] {
             let image_info = vk::DescriptorImageInfo::builder()
                 .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
@@ -729,6 +745,7 @@ impl Renderer {
             floor_b_descriptor_set,
             bullet_descriptor_set,
             explosion_descriptor_set,
+            hud_descriptor_set,
             vertex_buffer,
             vertex_buffer_memory,
             command_pool,
@@ -743,6 +760,7 @@ impl Renderer {
             _floor_b_texture_image: floor_b_image,
             _bullet_texture_image: bullet_image,
             _explosion_texture_image: explosion_image,
+            _hud_texture_image: hud_image,
             sampler,
         })
     }
@@ -770,6 +788,7 @@ impl Renderer {
         for i in 0..MAX_EXPLOSIONS {
             sprites_ndc[EXPLOSION_SPRITE_OFFSET + i] = state.explosion_dest_ndc(i);
         }
+        sprites_ndc[HUD_SPRITE_INDEX] = [-1.0, 1.0 - HUD_HEIGHT_NDC, 1.0, 1.0];
         let mut all_verts = [Vertex { pos: [0.0; 3], uv: [0.0; 2] }; DRAWN_SPRITE_COUNT * VERTS_PER_SPRITE];
         for (i, ndc) in sprites_ndc.iter().enumerate() {
             let verts = quad_vertices(*ndc);
@@ -808,6 +827,7 @@ impl Renderer {
         for i in 0..MAX_EXPLOSIONS {
             sets[EXPLOSION_SPRITE_OFFSET + i] = self.explosion_descriptor_set;
         }
+        sets[HUD_SPRITE_INDEX] = self.hud_descriptor_set;
         for (i, &set) in sets.iter().enumerate() {
             self.device.cmd_bind_descriptor_sets(self.command_buffer, vk::PipelineBindPoint::GRAPHICS, self.pipeline_layout, 0, &[set], &[]);
             self.device.cmd_draw(self.command_buffer, VERTS_PER_SPRITE as u32, 1, (i * VERTS_PER_SPRITE) as u32, 0);
@@ -896,21 +916,34 @@ unsafe fn create_solid_texture(
     queue_family_index: u32,
     color: Rgba8,
 ) -> Result<(vk::Image, vk::ImageView), String> {
-    let texture = TextureRgba8 { width: 1, height: 1, pixels: vec![color] };
-    const FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
+    create_texture_from_rgba(device, memory_properties, queue, queue_family_index, &TextureRgba8 { width: 1, height: 1, pixels: vec![color] })
+}
 
-    let tex_bytes_size = 4u64;
+/// 任意サイズのRGBA8テクスチャを実際にアップロードする(`create_solid_texture`
+/// の1x1専用実装を一般化したもの、HUDバナー画像等の任意画像に使う)。
+unsafe fn create_texture_from_rgba(
+    device: &ash::Device,
+    memory_properties: &vk::PhysicalDeviceMemoryProperties,
+    queue: vk::Queue,
+    queue_family_index: u32,
+    texture: &TextureRgba8,
+) -> Result<(vk::Image, vk::ImageView), String> {
+    const FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
+    let (width, height) = (texture.width, texture.height);
+
+    let tex_bytes_size = (width as u64) * (height as u64) * 4;
     let (staging_buffer, staging_memory) = create_host_visible_buffer(device, memory_properties, tex_bytes_size, vk::BufferUsageFlags::TRANSFER_SRC)?;
     let ptr = device.map_memory(staging_memory, 0, tex_bytes_size, vk::MemoryMapFlags::empty()).map_err(|e| e.to_string())?;
-    let dst = std::slice::from_raw_parts_mut(ptr as *mut u8, 4);
-    let p = texture.pixels[0];
-    dst.copy_from_slice(&[p.r, p.g, p.b, p.a]);
+    let dst = std::slice::from_raw_parts_mut(ptr as *mut u8, tex_bytes_size as usize);
+    for (i, p) in texture.pixels.iter().enumerate() {
+        dst[i * 4..i * 4 + 4].copy_from_slice(&[p.r, p.g, p.b, p.a]);
+    }
     device.unmap_memory(staging_memory);
 
     let image_info = vk::ImageCreateInfo::builder()
         .image_type(vk::ImageType::TYPE_2D)
         .format(FORMAT)
-        .extent(vk::Extent3D { width: 1, height: 1, depth: 1 })
+        .extent(vk::Extent3D { width, height, depth: 1 })
         .mip_levels(1)
         .array_layers(1)
         .samples(vk::SampleCountFlags::TYPE_1)
@@ -954,7 +987,7 @@ unsafe fn create_solid_texture(
         buffer_image_height: 0,
         image_subresource: vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 },
         image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
-        image_extent: vk::Extent3D { width: 1, height: 1, depth: 1 },
+        image_extent: vk::Extent3D { width, height, depth: 1 },
     };
     device.cmd_copy_buffer_to_image(cmd, staging_buffer, image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[copy_region]);
     let to_read = vk::ImageMemoryBarrier::builder()
