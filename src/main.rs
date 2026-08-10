@@ -15,6 +15,14 @@
 //! (=接近しすぎた)タイミングで照準が重なっていればヒット判定して
 //! 敵を奥へリセットする(得点はまだ加算しない、ヒットのログ出力のみ)。
 //!
+//! 弾+爆発ギミック(ユーザー指示、2026-08-10「弾を打てて当たると爆発する
+//! と良い」への対応): Spaceキーで照準の位置へ向けて弾(白)を発射する
+//! (最大`MAX_BULLETS`発まで同時飛行、`FIRE_COOLDOWN_FRAMES`フレームの
+//! クールダウン)。弾は画面下から照準位置へ`BULLET_TRAVEL_FRAMES`フレーム
+//! で直進し、着弾時に敵と十分近ければ命中——命中位置に爆発エフェクト
+//! (橙、`EXPLOSION_LIFETIME_FRAMES`フレームで拡大→消滅)を発生させ、
+//! 敵を奥へリセットする。外れた場合は爆発無しでそのまま弾が消える。
+//!
 //! 実行方法: `cargo run --release`
 
 use std::ffi::CString;
@@ -46,7 +54,43 @@ fn quad_vertices(dest_ndc: [f32; 4]) -> [Vertex; 6] {
     [tl, tr, br, tl, br, bl]
 }
 
-/// ゲーム状態: 照準(自機)+奥から迫る敵1体+固定の地面帯。
+const MAX_BULLETS: usize = 3;
+const MAX_EXPLOSIONS: usize = 3;
+const FIRE_COOLDOWN_FRAMES: u32 = 12;
+const BULLET_TRAVEL_FRAMES: f32 = 16.0;
+const EXPLOSION_LIFETIME_FRAMES: u32 = 18;
+
+#[derive(Clone, Copy)]
+struct Bullet {
+    active: bool,
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    t: f32,
+}
+
+impl Bullet {
+    const INACTIVE: Bullet = Bullet { active: false, x0: 0.0, y0: 0.0, x1: 0.0, y1: 0.0, t: 0.0 };
+
+    fn pos(&self) -> (f32, f32) {
+        (self.x0 + (self.x1 - self.x0) * self.t, self.y0 + (self.y1 - self.y0) * self.t)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Explosion {
+    active: bool,
+    x: f32,
+    y: f32,
+    timer: u32,
+}
+
+impl Explosion {
+    const INACTIVE: Explosion = Explosion { active: false, x: 0.0, y: 0.0, timer: 0 };
+}
+
+/// ゲーム状態: 照準(自機)+奥から迫る敵1体+固定の地面帯+弾+爆発。
 struct GameState {
     reticle_x: f32,
     reticle_y: f32,
@@ -58,6 +102,10 @@ struct GameState {
     enemy_depth: f32,
     enemy_x: f32,
     hits: u32,
+    fire_held: bool,
+    fire_cooldown: u32,
+    bullets: [Bullet; MAX_BULLETS],
+    explosions: [Explosion; MAX_EXPLOSIONS],
 }
 
 impl GameState {
@@ -72,6 +120,10 @@ impl GameState {
             enemy_depth: 0.0,
             enemy_x: 0.2,
             hits: 0,
+            fire_held: false,
+            fire_cooldown: 0,
+            bullets: [Bullet::INACTIVE; MAX_BULLETS],
+            explosions: [Explosion::INACTIVE; MAX_EXPLOSIONS],
         }
     }
 
@@ -93,22 +145,72 @@ impl GameState {
         self.reticle_y = self.reticle_y.clamp(-1.0, 0.5);
 
         self.enemy_depth += 0.006;
+        let mut enemy_hit_this_frame = false;
         if self.enemy_depth >= 1.0 {
             // 目前まで来て未撃墜ならリセット(ミス扱い、減点は今回未実装)。
             self.enemy_depth = 0.0;
             self.enemy_x = if self.enemy_x > 0.0 { -0.3 } else { 0.3 };
-            return;
+        } else {
+            // ヒット判定: 敵が十分近く(depth>0.7)、照準が敵の位置に十分近ければ命中
+            // (弾を撃たなくても近距離で自然に倒せる、既存のパッシブ判定)。
+            let enemy_half = self.enemy_half_size();
+            let dx = (self.reticle_x - self.enemy_x).abs();
+            let dy = (self.reticle_y - self.enemy_y()).abs();
+            if self.enemy_depth > 0.7 && dx < enemy_half * 1.5 && dy < enemy_half * 1.5 {
+                enemy_hit_this_frame = true;
+            }
         }
 
-        // ヒット判定: 敵が十分近く(depth>0.7)、照準が敵の位置に十分近ければ命中。
+        // 発射(Spaceキー)。クールダウン中・空きスロットが無ければ無視。
+        if self.fire_held && self.fire_cooldown == 0 {
+            if let Some(slot) = self.bullets.iter_mut().find(|b| !b.active) {
+                *slot = Bullet { active: true, x0: 0.0, y0: 0.9, x1: self.reticle_x, y1: self.reticle_y, t: 0.0 };
+                self.fire_cooldown = FIRE_COOLDOWN_FRAMES;
+            }
+        }
+        self.fire_cooldown = self.fire_cooldown.saturating_sub(1);
+
+        // 弾の飛行と着弾判定。
         let enemy_half = self.enemy_half_size();
-        let dx = (self.reticle_x - self.enemy_x).abs();
-        let dy = (self.reticle_y - self.enemy_y()).abs();
-        if self.enemy_depth > 0.7 && dx < enemy_half * 1.5 && dy < enemy_half * 1.5 {
+        let enemy_x = self.enemy_x;
+        let enemy_y = self.enemy_y();
+        let enemy_depth = self.enemy_depth;
+        let mut new_explosion: Option<(f32, f32)> = None;
+        for bullet in self.bullets.iter_mut() {
+            if !bullet.active {
+                continue;
+            }
+            bullet.t += 1.0 / BULLET_TRAVEL_FRAMES;
+            if bullet.t >= 1.0 {
+                bullet.active = false;
+                let dx = (bullet.x1 - enemy_x).abs();
+                let dy = (bullet.y1 - enemy_y).abs();
+                if enemy_depth > 0.05 && dx < enemy_half * 1.3 && dy < enemy_half * 1.3 {
+                    enemy_hit_this_frame = true;
+                    new_explosion = Some((bullet.x1, bullet.y1));
+                }
+            }
+        }
+        if let Some((x, y)) = new_explosion {
+            if let Some(exp) = self.explosions.iter_mut().find(|e| !e.active) {
+                *exp = Explosion { active: true, x, y, timer: EXPLOSION_LIFETIME_FRAMES };
+            }
+        }
+
+        if enemy_hit_this_frame {
             self.hits += 1;
             println!("HIT! total={}", self.hits);
             self.enemy_depth = 0.0;
             self.enemy_x = if self.enemy_x > 0.0 { -0.3 } else { 0.3 };
+        }
+
+        for explosion in self.explosions.iter_mut() {
+            if explosion.active {
+                explosion.timer = explosion.timer.saturating_sub(1);
+                if explosion.timer == 0 {
+                    explosion.active = false;
+                }
+            }
         }
     }
 
@@ -134,6 +236,26 @@ impl GameState {
 
     fn ground_dest_ndc(&self) -> [f32; 4] {
         [-1.0, 0.5, 1.0, 1.0]
+    }
+
+    fn bullet_dest_ndc(&self, i: usize) -> [f32; 4] {
+        let b = &self.bullets[i];
+        if !b.active {
+            return [-2.0, -2.0, -1.9, -1.9];
+        }
+        let (x, y) = b.pos();
+        [x - 0.015, y - 0.015, x + 0.015, y + 0.015]
+    }
+
+    fn explosion_dest_ndc(&self, i: usize) -> [f32; 4] {
+        let e = &self.explosions[i];
+        if !e.active {
+            return [-2.0, -2.0, -1.9, -1.9];
+        }
+        // 発生直後に急拡大し、その後じわじわ小さくなりながら消える。
+        let progress = 1.0 - (e.timer as f32 / EXPLOSION_LIFETIME_FRAMES as f32);
+        let h = 0.02 + 0.12 * (1.0 - (progress - 0.3).abs().min(1.0));
+        [e.x - h, e.y - h, e.x + h, e.y + h]
     }
 }
 
@@ -161,6 +283,7 @@ fn main() {
                     Some(VirtualKeyCode::Right) | Some(VirtualKeyCode::D) => state.right_held = pressed,
                     Some(VirtualKeyCode::Up) | Some(VirtualKeyCode::W) => state.up_held = pressed,
                     Some(VirtualKeyCode::Down) | Some(VirtualKeyCode::S) => state.down_held = pressed,
+                    Some(VirtualKeyCode::Space) => state.fire_held = pressed,
                     Some(VirtualKeyCode::Escape) => *control_flow = ControlFlow::Exit,
                     _ => {}
                 }
@@ -198,6 +321,8 @@ struct Renderer {
     ground_descriptor_set: vk::DescriptorSet,
     enemy_descriptor_set: vk::DescriptorSet,
     reticle_descriptor_set: vk::DescriptorSet,
+    bullet_descriptor_set: vk::DescriptorSet,
+    explosion_descriptor_set: vk::DescriptorSet,
     vertex_buffer: vk::Buffer,
     vertex_buffer_memory: vk::DeviceMemory,
     command_pool: vk::CommandPool,
@@ -208,8 +333,18 @@ struct Renderer {
     _ground_texture_image: vk::Image,
     _enemy_texture_image: vk::Image,
     _reticle_texture_image: vk::Image,
+    _bullet_texture_image: vk::Image,
+    _explosion_texture_image: vk::Image,
     sampler: vk::Sampler,
 }
+
+/// 固定スプライト(地面・敵・照準)+弾`MAX_BULLETS`発+爆発
+/// `MAX_EXPLOSIONS`個を毎フレーム描画する。
+const FIXED_SPRITE_COUNT: usize = 3;
+const DRAWN_SPRITE_COUNT: usize = FIXED_SPRITE_COUNT + MAX_BULLETS + MAX_EXPLOSIONS;
+/// 一意のテクスチャ数(地面・敵・照準・弾・爆発)。
+const TEXTURE_COUNT: usize = FIXED_SPRITE_COUNT + 2;
+const VERTS_PER_SPRITE: usize = 6;
 
 impl Renderer {
     unsafe fn new(window: &winit::window::Window) -> Result<Self, String> {
@@ -341,6 +476,8 @@ impl Renderer {
         let (ground_image, ground_view) = create_solid_texture(&device, &memory_properties, queue, queue_family_index, Rgba8 { r: 30, g: 140, b: 40, a: 255 })?;
         let (enemy_image, enemy_view) = create_solid_texture(&device, &memory_properties, queue, queue_family_index, Rgba8 { r: 210, g: 30, b: 30, a: 255 })?;
         let (reticle_image, reticle_view) = create_solid_texture(&device, &memory_properties, queue, queue_family_index, Rgba8 { r: 240, g: 220, b: 30, a: 255 })?;
+        let (bullet_image, bullet_view) = create_solid_texture(&device, &memory_properties, queue, queue_family_index, Rgba8 { r: 255, g: 255, b: 255, a: 255 })?;
+        let (explosion_image, explosion_view) = create_solid_texture(&device, &memory_properties, queue, queue_family_index, Rgba8 { r: 250, g: 140, b: 20, a: 255 })?;
 
         let sampler_info = vk::SamplerCreateInfo::builder().mag_filter(vk::Filter::NEAREST).min_filter(vk::Filter::NEAREST);
         let sampler = device.create_sampler(&sampler_info, None).map_err(|e| e.to_string())?;
@@ -355,17 +492,24 @@ impl Renderer {
         let dsl_info = vk::DescriptorSetLayoutCreateInfo::builder().bindings(&dsl_bindings);
         let descriptor_set_layout = device.create_descriptor_set_layout(&dsl_info, None).map_err(|e| e.to_string())?;
 
-        let pool_size = vk::DescriptorPoolSize { ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER, descriptor_count: 3 };
+        let pool_size = vk::DescriptorPoolSize { ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER, descriptor_count: TEXTURE_COUNT as u32 };
         let pool_sizes = [pool_size];
-        let descriptor_pool_info = vk::DescriptorPoolCreateInfo::builder().pool_sizes(&pool_sizes).max_sets(3);
+        let descriptor_pool_info = vk::DescriptorPoolCreateInfo::builder().pool_sizes(&pool_sizes).max_sets(TEXTURE_COUNT as u32);
         let descriptor_pool = device.create_descriptor_pool(&descriptor_pool_info, None).map_err(|e| e.to_string())?;
 
-        let set_layouts = [descriptor_set_layout, descriptor_set_layout, descriptor_set_layout];
+        let set_layouts = vec![descriptor_set_layout; TEXTURE_COUNT];
         let ds_alloc_info = vk::DescriptorSetAllocateInfo::builder().descriptor_pool(descriptor_pool).set_layouts(&set_layouts);
         let sets = device.allocate_descriptor_sets(&ds_alloc_info).map_err(|e| e.to_string())?;
-        let (ground_descriptor_set, enemy_descriptor_set, reticle_descriptor_set) = (sets[0], sets[1], sets[2]);
+        let (ground_descriptor_set, enemy_descriptor_set, reticle_descriptor_set, bullet_descriptor_set, explosion_descriptor_set) =
+            (sets[0], sets[1], sets[2], sets[3], sets[4]);
 
-        for (set, view) in [(ground_descriptor_set, ground_view), (enemy_descriptor_set, enemy_view), (reticle_descriptor_set, reticle_view)] {
+        for (set, view) in [
+            (ground_descriptor_set, ground_view),
+            (enemy_descriptor_set, enemy_view),
+            (reticle_descriptor_set, reticle_view),
+            (bullet_descriptor_set, bullet_view),
+            (explosion_descriptor_set, explosion_view),
+        ] {
             let image_info = vk::DescriptorImageInfo::builder()
                 .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
                 .image_view(view)
@@ -381,7 +525,7 @@ impl Renderer {
             device.update_descriptor_sets(&[write], &[]);
         }
 
-        let vbuf_size = (18 * std::mem::size_of::<Vertex>()) as vk::DeviceSize;
+        let vbuf_size = ((DRAWN_SPRITE_COUNT * VERTS_PER_SPRITE) * std::mem::size_of::<Vertex>()) as vk::DeviceSize;
         let (vertex_buffer, vertex_buffer_memory) =
             create_host_visible_buffer(&device, &memory_properties, vbuf_size, vk::BufferUsageFlags::VERTEX_BUFFER)?;
 
@@ -481,6 +625,8 @@ impl Renderer {
             ground_descriptor_set,
             enemy_descriptor_set,
             reticle_descriptor_set,
+            bullet_descriptor_set,
+            explosion_descriptor_set,
             vertex_buffer,
             vertex_buffer_memory,
             command_pool,
@@ -491,6 +637,8 @@ impl Renderer {
             _ground_texture_image: ground_image,
             _enemy_texture_image: enemy_image,
             _reticle_texture_image: reticle_image,
+            _bullet_texture_image: bullet_image,
+            _explosion_texture_image: explosion_image,
             sampler,
         })
     }
@@ -505,13 +653,21 @@ impl Renderer {
         };
         self.device.reset_fences(&[self.in_flight]).expect("reset_fences");
 
-        let ground_verts = quad_vertices(state.ground_dest_ndc());
-        let enemy_verts = quad_vertices(state.enemy_dest_ndc());
-        let reticle_verts = quad_vertices(state.reticle_dest_ndc());
-        let mut all_verts = [Vertex { pos: [0.0; 3], uv: [0.0; 2] }; 18];
-        all_verts[0..6].copy_from_slice(&ground_verts);
-        all_verts[6..12].copy_from_slice(&enemy_verts);
-        all_verts[12..18].copy_from_slice(&reticle_verts);
+        let mut sprites_ndc = [[0.0f32; 4]; DRAWN_SPRITE_COUNT];
+        sprites_ndc[0] = state.ground_dest_ndc();
+        sprites_ndc[1] = state.enemy_dest_ndc();
+        sprites_ndc[2] = state.reticle_dest_ndc();
+        for i in 0..MAX_BULLETS {
+            sprites_ndc[FIXED_SPRITE_COUNT + i] = state.bullet_dest_ndc(i);
+        }
+        for i in 0..MAX_EXPLOSIONS {
+            sprites_ndc[FIXED_SPRITE_COUNT + MAX_BULLETS + i] = state.explosion_dest_ndc(i);
+        }
+        let mut all_verts = [Vertex { pos: [0.0; 3], uv: [0.0; 2] }; DRAWN_SPRITE_COUNT * VERTS_PER_SPRITE];
+        for (i, ndc) in sprites_ndc.iter().enumerate() {
+            let verts = quad_vertices(*ndc);
+            all_verts[i * VERTS_PER_SPRITE..(i + 1) * VERTS_PER_SPRITE].copy_from_slice(&verts);
+        }
         let vbuf_size = std::mem::size_of_val(&all_verts) as vk::DeviceSize;
         let ptr = self.device.map_memory(self.vertex_buffer_memory, 0, vbuf_size, vk::MemoryMapFlags::empty()).expect("map vertex buffer");
         std::ptr::copy_nonoverlapping(all_verts.as_ptr() as *const u8, ptr as *mut u8, vbuf_size as usize);
@@ -532,9 +688,19 @@ impl Renderer {
         self.device.cmd_bind_pipeline(self.command_buffer, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
         self.device.cmd_bind_vertex_buffers(self.command_buffer, 0, &[self.vertex_buffer], &[0]);
 
-        for (set, first_vertex) in [(self.ground_descriptor_set, 0), (self.enemy_descriptor_set, 6), (self.reticle_descriptor_set, 12)] {
+        let mut sets = [self.ground_descriptor_set; DRAWN_SPRITE_COUNT];
+        sets[0] = self.ground_descriptor_set;
+        sets[1] = self.enemy_descriptor_set;
+        sets[2] = self.reticle_descriptor_set;
+        for i in 0..MAX_BULLETS {
+            sets[FIXED_SPRITE_COUNT + i] = self.bullet_descriptor_set;
+        }
+        for i in 0..MAX_EXPLOSIONS {
+            sets[FIXED_SPRITE_COUNT + MAX_BULLETS + i] = self.explosion_descriptor_set;
+        }
+        for (i, &set) in sets.iter().enumerate() {
             self.device.cmd_bind_descriptor_sets(self.command_buffer, vk::PipelineBindPoint::GRAPHICS, self.pipeline_layout, 0, &[set], &[]);
-            self.device.cmd_draw(self.command_buffer, 6, 1, first_vertex, 0);
+            self.device.cmd_draw(self.command_buffer, VERTS_PER_SPRITE as u32, 1, (i * VERTS_PER_SPRITE) as u32, 0);
         }
 
         self.device.cmd_end_render_pass(self.command_buffer);
