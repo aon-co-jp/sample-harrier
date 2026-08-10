@@ -14,3 +14,4 @@ raw-window-handle = "0.5"
 winit = "0.28"
 directx-shader-translate = { path = "../open-directx/crates/directx-shader-translate" }
 directx-graphics-vulkan = { path = "../open-directx/crates/directx-graphics-vulkan" }
+rodio = { version = "0.17", default-features = false }

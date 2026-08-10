@@ -18,12 +18,29 @@
 //! 弾+爆発ギミック(ユーザー指示、2026-08-10「弾を打てて当たると爆発する
 //! と良い」への対応): Spaceキーで照準の位置へ向けて弾(白)を発射する
 //! (最大`MAX_BULLETS`発まで同時飛行、`FIRE_COOLDOWN_FRAMES`フレームの
-//! クールダウン)。弾は画面下から照準位置へ`BULLET_TRAVEL_FRAMES`フレーム
-//! で直進し、着弾時に敵と十分近ければ命中——命中位置に爆発エフェクト
-//! (橙、`EXPLOSION_LIFETIME_FRAMES`フレームで拡大→消滅)を発生させ、
-//! 敵を奥へリセットする。外れた場合は爆発無しでそのまま弾が消える。
+//! クールダウン)。弾は画面下(自機付近)から照準位置へ`BULLET_TRAVEL_FRAMES`
+//! フレームで直進し、着弾時に敵と十分近ければ命中——命中位置に爆発
+//! エフェクト(橙、`EXPLOSION_LIFETIME_FRAMES`フレームで拡大→消滅)を
+//! 発生させ、敵を奥へリセットする。外れた場合は爆発無しでそのまま弾が
+//! 消える。
+//!
+//! 追加ギミック(ユーザー指示、2026-08-10「弾は近くから遠くに飛んでいく
+//! 大きな弾が縮小していく感じ、ハリアーのキャラクターと敵とボスを作って
+//! ハリアー風パロディBGMにして、床をラスタースクロールして」への対応):
+//! - 弾は発射直後(自機付近=近距離)が大きく、飛んでいくにつれて
+//!   (=画面奥へ向かうにつれて)縮小する——スペースハリアーの疑似3D
+//!   スケーリングの向きを弾にも適用した。
+//! - 自機(青いハリアー機のプレースホルダー)を照準の下に描画。
+//! - `BOSS_EVERY_N_DEFEATS`体撃墜するごとにボス(大型・複数回被弾が
+//!   必要)が出現する。
+//! - 床は単色の帯ではなく、`FLOOR_STRIPES`本の横帯が交互の色で
+//!   奥から手前へ流れる(疑似ラスタースクロール)。
+//! - BGMは既存楽曲の再現ではなく、8bit・疾走感のある曲想のみを参考に
+//!   した完全新規オリジナル曲(`audio.rs`)をループ再生する。
 //!
 //! 実行方法: `cargo run --release`
+
+mod audio;
 
 use std::ffi::CString;
 
@@ -59,6 +76,13 @@ const MAX_EXPLOSIONS: usize = 3;
 const FIRE_COOLDOWN_FRAMES: u32 = 12;
 const BULLET_TRAVEL_FRAMES: f32 = 16.0;
 const EXPLOSION_LIFETIME_FRAMES: u32 = 18;
+
+/// この数だけ通常の敵を倒すごとに、次の1体はボスになる。
+const BOSS_EVERY_N_DEFEATS: u32 = 3;
+/// ボスを倒すのに必要な命中回数(通常の敵は1回)。
+const BOSS_HITS_REQUIRED: u32 = 3;
+const FLOOR_STRIPES: usize = 8;
+const FLOOR_SCROLL_SPEED: f32 = 0.01;
 
 #[derive(Clone, Copy)]
 struct Bullet {
@@ -102,10 +126,14 @@ struct GameState {
     enemy_depth: f32,
     enemy_x: f32,
     hits: u32,
+    defeats: u32,
+    is_boss: bool,
+    boss_hits_remaining: u32,
     fire_held: bool,
     fire_cooldown: u32,
     bullets: [Bullet; MAX_BULLETS],
     explosions: [Explosion; MAX_EXPLOSIONS],
+    floor_scroll: f32,
 }
 
 impl GameState {
@@ -120,10 +148,24 @@ impl GameState {
             enemy_depth: 0.0,
             enemy_x: 0.2,
             hits: 0,
+            defeats: 0,
+            is_boss: false,
+            boss_hits_remaining: BOSS_HITS_REQUIRED,
             fire_held: false,
             fire_cooldown: 0,
             bullets: [Bullet::INACTIVE; MAX_BULLETS],
             explosions: [Explosion::INACTIVE; MAX_EXPLOSIONS],
+            floor_scroll: 0.0,
+        }
+    }
+
+    fn spawn_next_enemy(&mut self, from_positive_x: bool) {
+        self.enemy_depth = 0.0;
+        self.enemy_x = if from_positive_x { -0.3 } else { 0.3 };
+        self.is_boss = self.defeats > 0 && self.defeats % BOSS_EVERY_N_DEFEATS == 0;
+        self.boss_hits_remaining = BOSS_HITS_REQUIRED;
+        if self.is_boss {
+            println!("ボス出現! (被弾{}回で撃破)", BOSS_HITS_REQUIRED);
         }
     }
 
@@ -144,12 +186,14 @@ impl GameState {
         self.reticle_x = self.reticle_x.clamp(-1.0, 1.0);
         self.reticle_y = self.reticle_y.clamp(-1.0, 0.5);
 
+        self.floor_scroll = (self.floor_scroll + FLOOR_SCROLL_SPEED) % 1.0;
+
         self.enemy_depth += 0.006;
         let mut enemy_hit_this_frame = false;
         if self.enemy_depth >= 1.0 {
             // 目前まで来て未撃墜ならリセット(ミス扱い、減点は今回未実装)。
-            self.enemy_depth = 0.0;
-            self.enemy_x = if self.enemy_x > 0.0 { -0.3 } else { 0.3 };
+            let from_positive = self.enemy_x > 0.0;
+            self.spawn_next_enemy(from_positive);
         } else {
             // ヒット判定: 敵が十分近く(depth>0.7)、照準が敵の位置に十分近ければ命中
             // (弾を撃たなくても近距離で自然に倒せる、既存のパッシブ判定)。
@@ -199,9 +243,21 @@ impl GameState {
 
         if enemy_hit_this_frame {
             self.hits += 1;
-            println!("HIT! total={}", self.hits);
-            self.enemy_depth = 0.0;
-            self.enemy_x = if self.enemy_x > 0.0 { -0.3 } else { 0.3 };
+            if self.is_boss && self.boss_hits_remaining > 1 {
+                // ボスは複数回被弾するまで倒れない——ノックバックのみ
+                // (奥へ少し戻す)、まだ撃墜扱いにはしない。
+                self.boss_hits_remaining -= 1;
+                self.enemy_depth = (self.enemy_depth - 0.3).max(0.0);
+                println!("HIT! ボスに命中(残り{}発)", self.boss_hits_remaining);
+            } else {
+                println!("HIT! total={}", self.hits);
+                let from_positive = self.enemy_x > 0.0;
+                if self.is_boss {
+                    println!("ボス撃破!");
+                }
+                self.defeats += 1;
+                self.spawn_next_enemy(from_positive);
+            }
         }
 
         for explosion in self.explosions.iter_mut() {
@@ -215,7 +271,8 @@ impl GameState {
     }
 
     fn enemy_half_size(&self) -> f32 {
-        0.03 + self.enemy_depth * 0.35
+        let base = 0.03 + self.enemy_depth * 0.35;
+        if self.is_boss { base * 1.8 } else { base }
     }
 
     fn enemy_y(&self) -> f32 {
@@ -228,14 +285,30 @@ impl GameState {
         [self.reticle_x - h, self.reticle_y - h, self.reticle_x + h, self.reticle_y + h]
     }
 
+    /// 自機(ハリアー機のプレースホルダー)、照準のすぐ下に表示する。
+    fn ship_dest_ndc(&self) -> [f32; 4] {
+        let cx = self.reticle_x;
+        let cy = (self.reticle_y + 0.18).min(0.6);
+        [cx - 0.07, cy - 0.03, cx + 0.07, cy + 0.03]
+    }
+
     fn enemy_dest_ndc(&self) -> [f32; 4] {
         let h = self.enemy_half_size();
         let ey = self.enemy_y();
         [self.enemy_x - h, ey - h, self.enemy_x + h, ey + h]
     }
 
-    fn ground_dest_ndc(&self) -> [f32; 4] {
-        [-1.0, 0.5, 1.0, 1.0]
+    /// 疑似ラスタースクロールする床。`FLOOR_STRIPES`本の横帯を、
+    /// 遠い(上側)ほど薄く・近い(下側)ほど厚く描き、`floor_scroll`に
+    /// 応じて奥から手前へ流れるように各帯のY位置をずらす。
+    fn floor_stripe_dest_ndc(&self, i: usize) -> [f32; 4] {
+        let n = FLOOR_STRIPES as f32;
+        // 遠近感: 遠い帯ほど薄く、近い帯ほど厚くなる等比的な配分。
+        let t0 = (i as f32 + self.floor_scroll) / n;
+        let t1 = (i as f32 + 1.0 + self.floor_scroll) / n;
+        let y0 = 0.5 + 0.5 * t0 * t0;
+        let y1 = 0.5 + 0.5 * t1 * t1;
+        [-1.0, y0.min(1.0), 1.0, y1.min(1.0)]
     }
 
     fn bullet_dest_ndc(&self, i: usize) -> [f32; 4] {
@@ -244,7 +317,11 @@ impl GameState {
             return [-2.0, -2.0, -1.9, -1.9];
         }
         let (x, y) = b.pos();
-        [x - 0.015, y - 0.015, x + 0.015, y + 0.015]
+        // 発射直後(自機付近、近距離)は大きく、飛んでいくにつれて
+        // (=奥へ向かうにつれて)縮小する——スケーリングスプライトの
+        // 向きを弾にも適用した(ユーザー指示、2026-08-10)。
+        let h = 0.05 * (1.0 - b.t) + 0.01 * b.t;
+        [x - h, y - h, x + h, y + h]
     }
 
     fn explosion_dest_ndc(&self, i: usize) -> [f32; 4] {
@@ -266,6 +343,11 @@ fn main() {
         .with_inner_size(winit::dpi::LogicalSize::new(WIDTH, HEIGHT))
         .build(&event_loop)
         .expect("create window");
+
+    // BGM再生ハンドルはイベントループが動いている間ずっと保持する
+    // (dropすると再生が止まる、`event_loop.run`は戻らないため事実上
+    // プロセス終了までスコープに残る)。
+    let _bgm = audio::play_bgm_loop();
 
     let mut renderer = unsafe { Renderer::new(&window) }.expect("create Vulkan renderer");
     let mut state = GameState::new();
@@ -318,9 +400,11 @@ struct Renderer {
     pipeline: vk::Pipeline,
     descriptor_pool: vk::DescriptorPool,
     descriptor_set_layout: vk::DescriptorSetLayout,
-    ground_descriptor_set: vk::DescriptorSet,
     enemy_descriptor_set: vk::DescriptorSet,
     reticle_descriptor_set: vk::DescriptorSet,
+    ship_descriptor_set: vk::DescriptorSet,
+    floor_a_descriptor_set: vk::DescriptorSet,
+    floor_b_descriptor_set: vk::DescriptorSet,
     bullet_descriptor_set: vk::DescriptorSet,
     explosion_descriptor_set: vk::DescriptorSet,
     vertex_buffer: vk::Buffer,
@@ -330,20 +414,25 @@ struct Renderer {
     image_available: vk::Semaphore,
     render_finished: vk::Semaphore,
     in_flight: vk::Fence,
-    _ground_texture_image: vk::Image,
     _enemy_texture_image: vk::Image,
     _reticle_texture_image: vk::Image,
+    _ship_texture_image: vk::Image,
+    _floor_a_texture_image: vk::Image,
+    _floor_b_texture_image: vk::Image,
     _bullet_texture_image: vk::Image,
     _explosion_texture_image: vk::Image,
     sampler: vk::Sampler,
 }
 
-/// 固定スプライト(地面・敵・照準)+弾`MAX_BULLETS`発+爆発
-/// `MAX_EXPLOSIONS`個を毎フレーム描画する。
+/// 固定スプライト(敵・照準・自機)+床`FLOOR_STRIPES`本+弾
+/// `MAX_BULLETS`発+爆発`MAX_EXPLOSIONS`個を毎フレーム描画する。
 const FIXED_SPRITE_COUNT: usize = 3;
-const DRAWN_SPRITE_COUNT: usize = FIXED_SPRITE_COUNT + MAX_BULLETS + MAX_EXPLOSIONS;
-/// 一意のテクスチャ数(地面・敵・照準・弾・爆発)。
-const TEXTURE_COUNT: usize = FIXED_SPRITE_COUNT + 2;
+const FLOOR_SPRITE_OFFSET: usize = FIXED_SPRITE_COUNT;
+const BULLET_SPRITE_OFFSET: usize = FLOOR_SPRITE_OFFSET + FLOOR_STRIPES;
+const EXPLOSION_SPRITE_OFFSET: usize = BULLET_SPRITE_OFFSET + MAX_BULLETS;
+const DRAWN_SPRITE_COUNT: usize = EXPLOSION_SPRITE_OFFSET + MAX_EXPLOSIONS;
+/// 一意のテクスチャ数(敵・照準・自機・床2色・弾・爆発)。
+const TEXTURE_COUNT: usize = FIXED_SPRITE_COUNT + 4;
 const VERTS_PER_SPRITE: usize = 6;
 
 impl Renderer {
@@ -473,9 +562,11 @@ impl Renderer {
             })
             .collect();
 
-        let (ground_image, ground_view) = create_solid_texture(&device, &memory_properties, queue, queue_family_index, Rgba8 { r: 30, g: 140, b: 40, a: 255 })?;
         let (enemy_image, enemy_view) = create_solid_texture(&device, &memory_properties, queue, queue_family_index, Rgba8 { r: 210, g: 30, b: 30, a: 255 })?;
         let (reticle_image, reticle_view) = create_solid_texture(&device, &memory_properties, queue, queue_family_index, Rgba8 { r: 240, g: 220, b: 30, a: 255 })?;
+        let (ship_image, ship_view) = create_solid_texture(&device, &memory_properties, queue, queue_family_index, Rgba8 { r: 40, g: 90, b: 220, a: 255 })?;
+        let (floor_a_image, floor_a_view) = create_solid_texture(&device, &memory_properties, queue, queue_family_index, Rgba8 { r: 30, g: 140, b: 40, a: 255 })?;
+        let (floor_b_image, floor_b_view) = create_solid_texture(&device, &memory_properties, queue, queue_family_index, Rgba8 { r: 15, g: 100, b: 25, a: 255 })?;
         let (bullet_image, bullet_view) = create_solid_texture(&device, &memory_properties, queue, queue_family_index, Rgba8 { r: 255, g: 255, b: 255, a: 255 })?;
         let (explosion_image, explosion_view) = create_solid_texture(&device, &memory_properties, queue, queue_family_index, Rgba8 { r: 250, g: 140, b: 20, a: 255 })?;
 
@@ -500,13 +591,22 @@ impl Renderer {
         let set_layouts = vec![descriptor_set_layout; TEXTURE_COUNT];
         let ds_alloc_info = vk::DescriptorSetAllocateInfo::builder().descriptor_pool(descriptor_pool).set_layouts(&set_layouts);
         let sets = device.allocate_descriptor_sets(&ds_alloc_info).map_err(|e| e.to_string())?;
-        let (ground_descriptor_set, enemy_descriptor_set, reticle_descriptor_set, bullet_descriptor_set, explosion_descriptor_set) =
-            (sets[0], sets[1], sets[2], sets[3], sets[4]);
+        let (
+            enemy_descriptor_set,
+            reticle_descriptor_set,
+            ship_descriptor_set,
+            floor_a_descriptor_set,
+            floor_b_descriptor_set,
+            bullet_descriptor_set,
+            explosion_descriptor_set,
+        ) = (sets[0], sets[1], sets[2], sets[3], sets[4], sets[5], sets[6]);
 
         for (set, view) in [
-            (ground_descriptor_set, ground_view),
             (enemy_descriptor_set, enemy_view),
             (reticle_descriptor_set, reticle_view),
+            (ship_descriptor_set, ship_view),
+            (floor_a_descriptor_set, floor_a_view),
+            (floor_b_descriptor_set, floor_b_view),
             (bullet_descriptor_set, bullet_view),
             (explosion_descriptor_set, explosion_view),
         ] {
@@ -622,9 +722,11 @@ impl Renderer {
             pipeline,
             descriptor_pool,
             descriptor_set_layout,
-            ground_descriptor_set,
             enemy_descriptor_set,
             reticle_descriptor_set,
+            ship_descriptor_set,
+            floor_a_descriptor_set,
+            floor_b_descriptor_set,
             bullet_descriptor_set,
             explosion_descriptor_set,
             vertex_buffer,
@@ -634,9 +736,11 @@ impl Renderer {
             image_available,
             render_finished,
             in_flight,
-            _ground_texture_image: ground_image,
             _enemy_texture_image: enemy_image,
             _reticle_texture_image: reticle_image,
+            _ship_texture_image: ship_image,
+            _floor_a_texture_image: floor_a_image,
+            _floor_b_texture_image: floor_b_image,
             _bullet_texture_image: bullet_image,
             _explosion_texture_image: explosion_image,
             sampler,
@@ -654,14 +758,17 @@ impl Renderer {
         self.device.reset_fences(&[self.in_flight]).expect("reset_fences");
 
         let mut sprites_ndc = [[0.0f32; 4]; DRAWN_SPRITE_COUNT];
-        sprites_ndc[0] = state.ground_dest_ndc();
-        sprites_ndc[1] = state.enemy_dest_ndc();
-        sprites_ndc[2] = state.reticle_dest_ndc();
+        sprites_ndc[0] = state.enemy_dest_ndc();
+        sprites_ndc[1] = state.reticle_dest_ndc();
+        sprites_ndc[2] = state.ship_dest_ndc();
+        for i in 0..FLOOR_STRIPES {
+            sprites_ndc[FLOOR_SPRITE_OFFSET + i] = state.floor_stripe_dest_ndc(i);
+        }
         for i in 0..MAX_BULLETS {
-            sprites_ndc[FIXED_SPRITE_COUNT + i] = state.bullet_dest_ndc(i);
+            sprites_ndc[BULLET_SPRITE_OFFSET + i] = state.bullet_dest_ndc(i);
         }
         for i in 0..MAX_EXPLOSIONS {
-            sprites_ndc[FIXED_SPRITE_COUNT + MAX_BULLETS + i] = state.explosion_dest_ndc(i);
+            sprites_ndc[EXPLOSION_SPRITE_OFFSET + i] = state.explosion_dest_ndc(i);
         }
         let mut all_verts = [Vertex { pos: [0.0; 3], uv: [0.0; 2] }; DRAWN_SPRITE_COUNT * VERTS_PER_SPRITE];
         for (i, ndc) in sprites_ndc.iter().enumerate() {
@@ -688,15 +795,18 @@ impl Renderer {
         self.device.cmd_bind_pipeline(self.command_buffer, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
         self.device.cmd_bind_vertex_buffers(self.command_buffer, 0, &[self.vertex_buffer], &[0]);
 
-        let mut sets = [self.ground_descriptor_set; DRAWN_SPRITE_COUNT];
-        sets[0] = self.ground_descriptor_set;
-        sets[1] = self.enemy_descriptor_set;
-        sets[2] = self.reticle_descriptor_set;
+        let mut sets = [self.enemy_descriptor_set; DRAWN_SPRITE_COUNT];
+        sets[0] = self.enemy_descriptor_set;
+        sets[1] = self.reticle_descriptor_set;
+        sets[2] = self.ship_descriptor_set;
+        for i in 0..FLOOR_STRIPES {
+            sets[FLOOR_SPRITE_OFFSET + i] = if i % 2 == 0 { self.floor_a_descriptor_set } else { self.floor_b_descriptor_set };
+        }
         for i in 0..MAX_BULLETS {
-            sets[FIXED_SPRITE_COUNT + i] = self.bullet_descriptor_set;
+            sets[BULLET_SPRITE_OFFSET + i] = self.bullet_descriptor_set;
         }
         for i in 0..MAX_EXPLOSIONS {
-            sets[FIXED_SPRITE_COUNT + MAX_BULLETS + i] = self.explosion_descriptor_set;
+            sets[EXPLOSION_SPRITE_OFFSET + i] = self.explosion_descriptor_set;
         }
         for (i, &set) in sets.iter().enumerate() {
             self.device.cmd_bind_descriptor_sets(self.command_buffer, vk::PipelineBindPoint::GRAPHICS, self.pipeline_layout, 0, &[set], &[]);
