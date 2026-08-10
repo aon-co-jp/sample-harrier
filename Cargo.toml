@@ -1,0 +1,16 @@
+[package]
+name = "sample-harrier"
+version = "0.1.0"
+edition = "2021"
+authors = ["aon-co-jp"]
+license = "MIT"
+repository = "https://github.com/aon-co-jp/sample-harrier"
+description = "Space Harrier-style pseudo-3D scaling-sprite short game prototype, built on open-directx's DXBC->SPIR-V translated sprite pipeline."
+
+[dependencies]
+ash = { version = "0.37", default-features = false, features = ["loaded"] }
+ash-window = "0.12"
+raw-window-handle = "0.5"
+winit = "0.28"
+directx-shader-translate = { path = "../open-directx/crates/directx-shader-translate" }
+directx-graphics-vulkan = { path = "../open-directx/crates/directx-graphics-vulkan" }
