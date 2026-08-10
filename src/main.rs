@@ -42,6 +42,7 @@
 
 mod audio;
 mod font;
+mod sprite;
 
 use std::ffi::CString;
 
@@ -406,6 +407,7 @@ struct Renderer {
     descriptor_pool: vk::DescriptorPool,
     descriptor_set_layout: vk::DescriptorSetLayout,
     enemy_descriptor_set: vk::DescriptorSet,
+    boss_descriptor_set: vk::DescriptorSet,
     reticle_descriptor_set: vk::DescriptorSet,
     ship_descriptor_set: vk::DescriptorSet,
     floor_a_descriptor_set: vk::DescriptorSet,
@@ -421,6 +423,7 @@ struct Renderer {
     render_finished: vk::Semaphore,
     in_flight: vk::Fence,
     _enemy_texture_image: vk::Image,
+    _boss_texture_image: vk::Image,
     _reticle_texture_image: vk::Image,
     _ship_texture_image: vk::Image,
     _floor_a_texture_image: vk::Image,
@@ -440,7 +443,7 @@ const EXPLOSION_SPRITE_OFFSET: usize = BULLET_SPRITE_OFFSET + MAX_BULLETS;
 const HUD_SPRITE_INDEX: usize = EXPLOSION_SPRITE_OFFSET + MAX_EXPLOSIONS;
 const DRAWN_SPRITE_COUNT: usize = HUD_SPRITE_INDEX + 1;
 /// 一意のテクスチャ数(敵・照準・自機・床2色・弾・爆発・HUDバナー)。
-const TEXTURE_COUNT: usize = FIXED_SPRITE_COUNT + 5;
+const TEXTURE_COUNT: usize = FIXED_SPRITE_COUNT + 6;
 const VERTS_PER_SPRITE: usize = 6;
 const HUD_TEXT: &str = "ARROWS/WASD MOVE  SPACE FIRE  ESC/X CLOSE";
 /// HUDバナーの画面下からの高さ(NDC単位)。
@@ -574,9 +577,13 @@ impl Renderer {
             })
             .collect();
 
-        let (enemy_image, enemy_view) = create_solid_texture(&device, &memory_properties, queue, queue_family_index, Rgba8 { r: 210, g: 30, b: 30, a: 255 })?;
+        let (enemy_image, enemy_view) =
+            create_texture_from_rgba(&device, &memory_properties, queue, queue_family_index, &sprite::rasterize(sprite::ENEMY, sprite::enemy_palette, 2))?;
+        let (boss_image, boss_view) =
+            create_texture_from_rgba(&device, &memory_properties, queue, queue_family_index, &sprite::rasterize(sprite::BOSS, sprite::boss_palette, 2))?;
         let (reticle_image, reticle_view) = create_solid_texture(&device, &memory_properties, queue, queue_family_index, Rgba8 { r: 240, g: 220, b: 30, a: 255 })?;
-        let (ship_image, ship_view) = create_solid_texture(&device, &memory_properties, queue, queue_family_index, Rgba8 { r: 40, g: 90, b: 220, a: 255 })?;
+        let (ship_image, ship_view) =
+            create_texture_from_rgba(&device, &memory_properties, queue, queue_family_index, &sprite::rasterize(sprite::SHIP, sprite::ship_palette, 2))?;
         let (floor_a_image, floor_a_view) = create_solid_texture(&device, &memory_properties, queue, queue_family_index, Rgba8 { r: 30, g: 140, b: 40, a: 255 })?;
         let (floor_b_image, floor_b_view) = create_solid_texture(&device, &memory_properties, queue, queue_family_index, Rgba8 { r: 15, g: 100, b: 25, a: 255 })?;
         let (bullet_image, bullet_view) = create_solid_texture(&device, &memory_properties, queue, queue_family_index, Rgba8 { r: 255, g: 255, b: 255, a: 255 })?;
@@ -607,6 +614,7 @@ impl Renderer {
         let sets = device.allocate_descriptor_sets(&ds_alloc_info).map_err(|e| e.to_string())?;
         let (
             enemy_descriptor_set,
+            boss_descriptor_set,
             reticle_descriptor_set,
             ship_descriptor_set,
             floor_a_descriptor_set,
@@ -614,10 +622,11 @@ impl Renderer {
             bullet_descriptor_set,
             explosion_descriptor_set,
             hud_descriptor_set,
-        ) = (sets[0], sets[1], sets[2], sets[3], sets[4], sets[5], sets[6], sets[7]);
+        ) = (sets[0], sets[1], sets[2], sets[3], sets[4], sets[5], sets[6], sets[7], sets[8]);
 
         for (set, view) in [
             (enemy_descriptor_set, enemy_view),
+            (boss_descriptor_set, boss_view),
             (reticle_descriptor_set, reticle_view),
             (ship_descriptor_set, ship_view),
             (floor_a_descriptor_set, floor_a_view),
@@ -739,6 +748,7 @@ impl Renderer {
             descriptor_pool,
             descriptor_set_layout,
             enemy_descriptor_set,
+            boss_descriptor_set,
             reticle_descriptor_set,
             ship_descriptor_set,
             floor_a_descriptor_set,
@@ -754,6 +764,7 @@ impl Renderer {
             render_finished,
             in_flight,
             _enemy_texture_image: enemy_image,
+            _boss_texture_image: boss_image,
             _reticle_texture_image: reticle_image,
             _ship_texture_image: ship_image,
             _floor_a_texture_image: floor_a_image,
@@ -815,7 +826,7 @@ impl Renderer {
         self.device.cmd_bind_vertex_buffers(self.command_buffer, 0, &[self.vertex_buffer], &[0]);
 
         let mut sets = [self.enemy_descriptor_set; DRAWN_SPRITE_COUNT];
-        sets[0] = self.enemy_descriptor_set;
+        sets[0] = if state.is_boss { self.boss_descriptor_set } else { self.enemy_descriptor_set };
         sets[1] = self.reticle_descriptor_set;
         sets[2] = self.ship_descriptor_set;
         for i in 0..FLOOR_STRIPES {
