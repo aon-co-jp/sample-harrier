@@ -408,6 +408,7 @@ checksum = "0c87e182de0887fd5361989c677c4e8f5000cd9491d6d563161a8f3a5519fc7f"
 [[package]]
 name = "directx-graphics-vulkan"
 version = "0.1.0"
+source = "git+https://github.com/aon-co-jp/open-directx#e55cefa3cb68d12151e3c79fbf640f67ccc86f7e"
 dependencies = [
  "ash",
  "png",
@@ -417,9 +418,11 @@ dependencies = [
 [[package]]
 name = "directx-shader-translate"
 version = "0.1.0"
+source = "git+https://github.com/aon-co-jp/open-directx#e55cefa3cb68d12151e3c79fbf640f67ccc86f7e"
 dependencies = [
  "dxbc",
  "llvm-bitcode",
+ "open-cpu",
  "rspirv",
  "thiserror",
 ]
@@ -1048,6 +1051,14 @@ name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
+
+[[package]]
+name = "open-cpu"
+version = "0.1.0"
+source = "git+https://github.com/aon-co-jp/open-cpu#efa35b50f30211d7ddc68183b995e1d9eef9e7e1"
+dependencies = [
+ "jni",
+]
 
 [[package]]
 name = "orbclient"

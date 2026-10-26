@@ -12,6 +12,6 @@ ash = { version = "0.37", default-features = false, features = ["loaded"] }
 ash-window = "0.12"
 raw-window-handle = "0.5"
 winit = "0.28"
-directx-shader-translate = { path = "../open-directx/crates/directx-shader-translate" }
-directx-graphics-vulkan = { path = "../open-directx/crates/directx-graphics-vulkan" }
+directx-shader-translate = { git = "https://github.com/aon-co-jp/open-directx" }
+directx-graphics-vulkan = { git = "https://github.com/aon-co-jp/open-directx" }
 rodio = { version = "0.17", default-features = false }
